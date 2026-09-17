@@ -1,0 +1,45 @@
+<!DOCTYPE html><meta charset="utf-8"><body><pre id="out">measuring…</pre>
+<script>
+var FILES = ['bird1.png','bird2.png','branches.png','hair.png','heart.png','background.png'];
+var A = 8; // alpha threshold
+function measure(src){
+  return new Promise(function(res){
+    var img = new Image();
+    img.onload = function(){
+      var c = document.createElement('canvas');
+      c.width = img.naturalWidth; c.height = img.naturalHeight;
+      var g = c.getContext('2d'); g.drawImage(img,0,0);
+      var d = g.getImageData(0,0,c.width,c.height).data;
+      var minX=1e9,maxX=-1,minY=1e9,maxY=-1,n=0;
+      var sx=0, sy=0, sw=0;
+      for(var y=0;y<c.height;y++){
+        for(var x=0;x<c.width;x++){
+          var a = d[(y*c.width+x)*4+3];
+          if(a>A){
+            n++;
+            if(x<minX)minX=x; if(x>maxX)maxX=x;
+            if(y<minY)minY=y; if(y>maxY)maxY=y;
+            sx += x*a; sy += y*a; sw += a;   // alpha-weighted centroid
+          }
+        }
+      }
+      if(n===0){ res({file:src, empty:true}); return; }
+      var W=c.width, H=c.height;
+      res({
+        file: src, px: W+'x'+H, coverage: +(100*n/(W*H)).toFixed(2)+'%',
+        // u left->right, v BOTTOM-up to match the shader convention
+        uMin:+(minX/W).toFixed(4), uMax:+((maxX+1)/W).toFixed(4),
+        vMin:+(1-(maxY+1)/H).toFixed(4), vMax:+(1-minY/H).toFixed(4),
+        uCentroid:+((sx/sw)/W).toFixed(4), vCentroid:+(1-(sy/sw)/H).toFixed(4),
+        uMidBox:+(((minX+maxX+1)/2)/W).toFixed(4)
+      });
+    };
+    img.onerror = function(){ res({file:src, error:'load failed'}); };
+    img.src = src + '?v=' + Date.now();
+  });
+}
+Promise.all(FILES.map(measure)).then(function(r){
+  document.getElementById('out').textContent = JSON.stringify(r,null,2);
+  window.__result = r;
+});
+</script></body>

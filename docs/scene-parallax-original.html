@@ -1,0 +1,437 @@
+<title>Painting One, Phone Build</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<style>
+  :root{
+    --paper: #E7EDEC; --surface: #F4F7F6; --ink: #1E2422; --ink-soft: #4B5654; --line: #C6D0CD; --scan: #146C7A;
+  }
+  @media (prefers-color-scheme: dark){
+    :root:not([data-theme="light"]){ --paper:#14181A; --surface:#1B2123; --ink:#E7EEEC; --ink-soft:#A7B4B1; --line:#33403E; --scan:#5FC3D3; }
+  }
+  :root[data-theme="dark"]{ --paper:#14181A; --surface:#1B2123; --ink:#E7EEEC; --ink-soft:#A7B4B1; --line:#33403E; --scan:#5FC3D3; }
+  *{ box-sizing: border-box; }
+  body{ background: var(--paper); color: var(--ink); font-family: -apple-system, "Segoe UI", system-ui, sans-serif; margin:0; }
+  .wrap{ max-width: 720px; margin: 0 auto; padding: 36px 24px 56px; }
+  h1{ font-size: 24px; margin: 0 0 8px; }
+  .note{ color: var(--ink-soft); font-size: 14.5px; max-width: 60ch; margin: 0 0 4px; }
+  .live-tag{
+    display:inline-block; font-family: ui-monospace, "SF Mono", monospace; font-size: 11px;
+    letter-spacing:.06em; text-transform:uppercase; color: var(--scan);
+    border: 1px solid var(--scan); border-radius: 3px; padding: 3px 8px; margin-bottom: 14px;
+  }
+  #stage{
+    width: 100%; height: 74vh; min-height: 460px;
+    border: 1px solid var(--line); background: var(--surface);
+    margin-top: 16px; cursor: grab; touch-action: none; overflow:hidden;
+  }
+  #stage canvas{ display:block; width:100%; height:100%; }
+  #status{
+    position:absolute; top:10px; left:10px; z-index:2;
+    font-family: ui-monospace, "SF Mono", monospace; font-size: 11px; line-height:1.7;
+    background: var(--surface); border: 1px solid var(--line); border-radius: 4px;
+    padding: 8px 12px; color: var(--ink-soft); pointer-events:none;
+  }
+  #status b{ color: var(--ink); }
+  #status .ok{ color: #3E7D5A; }
+  #status .fail{ color: #A8412F; }
+  footer{ margin-top: 18px; font-size: 13px; color: var(--ink-soft); max-width: 62ch; }
+</style>
+
+  <div id="stage" style="position:absolute">
+    <div id="status"><b></b></div>
+  </div>
+
+<script>
+(function(){
+  var stage = document.getElementById('stage');
+  var statusEl = document.getElementById('status');
+  var statusLines = {};
+  function setStatus(key, ok, detail){
+    statusLines[key] = '<span class="' + (ok ? 'ok' : 'fail') + '">' + (ok ? '✓' : '✗') + '</span> ' + key + (detail ? ' — ' + detail : '');
+    var html = '<b>L</b><br>' + Object.keys(files || {}).map(function(k){ return statusLines[k] || ('… ' + k); }).join('<br>');
+  }
+
+  var FOV = 35;
+  var scene = new THREE.Scene();
+  var camera = new THREE.PerspectiveCamera(FOV, 1, 0.1, 100);
+
+  var renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+  stage.appendChild(renderer.domElement);
+
+  var ASPECT = 2644 / 3526;
+  var PLANE_H = 2.2;
+  var PLANE_W = PLANE_H * ASPECT;
+  var geo = new THREE.PlaneGeometry(PLANE_W, PLANE_H);
+  var geoBend = new THREE.PlaneGeometry(PLANE_W, PLANE_H, 1, 64); // extra vertical segments so a layer can bend
+  var camDist = 3.4;
+
+  function resize(){
+    var w = stage.clientWidth, h = stage.clientHeight;
+    renderer.setSize(w, h);
+    camera.aspect = w / h;
+    camera.updateProjectionMatrix();
+
+    // fit the whole plane inside the frustum with a 12% margin, on whichever axis is tighter
+    var vFov = FOV * Math.PI / 180;
+    var distForHeight = (PLANE_H / 2) / Math.tan(vFov / 2);
+    var hFov = 2 * Math.atan(Math.tan(vFov / 2) * camera.aspect);
+    var distForWidth = (PLANE_W / 2) / Math.tan(hFov / 2);
+    camDist = Math.max(distForHeight, distForWidth) * 1.3;
+  }
+  window.addEventListener('resize', resize);
+
+  var loader = new THREE.TextureLoader();
+  var files = {
+    background: 'background.png',
+    ocean: 'ocean_spritesheet.png',
+    hair: 'hair.png',
+    branches: 'branches.png',
+    bird1: 'bird1.png',
+    bird2: 'bird2.png',
+    heart: 'heart.png'
+  };
+  // NOTE: exaggerated ~15x for this demo so the parallax is visible on a flat screen.
+  // Real AR use should shrink these back toward millimeter-scale (see roadmap) once
+  // it's tracked to the physical painting, where true depth does the work instead.
+  var depths = {
+    background: 0,
+    ocean: 0.09,
+    hair: 0.24,
+    branches: 0.45,
+    // The birds perch on the branches, so they belong at essentially the branch's own
+    // depth. A hair in front is enough to keep them off it in the sort without letting
+    // them drift away from their perch as the viewer moves.
+    // bird2 rides a touch in front of bird1 rather than sharing its depth. Every layer
+    // is a full-canvas quad and a transparent fragment still writes depth, so two of them
+    // at the same z stamp over each other's empty area and one disappears. The gap has to
+    // clear the sway wobble the two birds inherit from the branch — that differential
+    // peaks around 0.0025, so 0.01 is a comfortable margin, and it still leaves the heart
+    // (0.5) safely in front of bird2.
+    bird1: 0.47,
+    bird2: 0.48,
+    heart: 0.5
+  };
+
+  var PLAIN_VERT = [
+    'varying vec2 vUv;',
+    'void main(){',
+    '  vUv = uv;',
+    '  gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);',
+    '}'
+  ].join('\n');
+
+  // Sheet-aware: for a layer with no sheet, uCell is (0,0) and uCellSize is (1,1),
+  // which reduces to sampling the plain texture — same output as before.
+  var SHEET_FRAG = [
+    'varying vec2 vUv;',
+    'uniform sampler2D uMap;',
+    'uniform vec2 uCell;',
+    'uniform vec2 uCellSize;',
+    'void main(){',
+    '  gl_FragColor = texture2D(uMap, uCell + vUv * uCellSize);',
+    '}'
+  ].join('\n');
+
+  // The ocean disc's bounding ellipse, measured from ocean.png's own alpha:
+  // centre (0.4985, 0.686), half-extents (0.179, 0.189) in canvas UV.
+  var DISC = { cx: 0.4985, cy: 0.686, rx: 0.179, ry: 0.189 };
+
+  // Measured from each layer's own alpha: hair occupies v 0.431-0.968, branches
+  // v 0.003-0.622. The sway gradient has to be remapped onto that span — written against
+  // the whole canvas instead, hair only reached 0.41 of its intended swing, branches 0.48.
+  //
+  // amp is the primary swing at the free tips, in world units; the plane is 1.65 wide,
+  // so 0.10 is roughly a 6% swing and 0.18 about 11%. These are the numbers to turn up
+  // or down.
+  //
+  // guardDisc holds the hair still where it frames the ocean disc. The disc sits in a hole
+  // cut through the hair, so those two things can't both be true: either the disc rides the
+  // hair (they move as one head, but the ocean reads as moving) or the disc stays put and
+  // the hole slides off it, opening a crescent of bare wall. Damping the hair's swing to
+  // nothing around the aperture resolves it — the hole stops moving, so the disc doesn't
+  // have to follow, and the swing is free to grow toward the loose ends where it's wanted.
+  // It's also how hair behaves: constrained where it frames the face, loose at the tips.
+  // The heart still borrows BRANCH_SPAN wholesale, amp included, for the original reason.
+  var HAIR_SPAN   = { vMin: 0.431, vMax: 0.968, anchorAtTop: true,  phase: 0.0, amp: 0.18, guardDisc: true };
+  var BRANCH_SPAN = { vMin: 0.003, vMax: 0.622, anchorAtTop: false, phase: 2.1, amp: 0.10 };
+
+  // Each bird has to do two things at once: rock on the spot, and travel with the branch
+  // it is standing on. If it only rocked, it would slide off its perch the moment the
+  // branches swayed. The branch displacement is therefore sampled at the perch height
+  // only — one constant, not the gradient the branches themselves use — so a bird moves
+  // as one rigid body rather than shearing across the 0.12 of v it covers.
+  //
+  // pivot is each bird's alpha-weighted centroid, measured from its own PNG. It lands in
+  // the body mass just above the feet, so the rock reads as tipping on the perch instead
+  // of swinging from the tail. To pivot closer to the branch itself, drop v toward the
+  // bbox floor (bird1 0.3216, bird2 0.3033).
+  //
+  // amp is the swing in radians (0.16 is about 9 degrees) and freq the beats per second
+  // inside a burst. A bird flaps for BIRD_BURST, then holds still for BIRD_REST; delay
+  // staggers the two so they never beat together. That pause is what keeps it from
+  // reading as a wind-up toy — a continuous sine is the thing that looks mechanical.
+  var BIRD_BURST = 0.90;   // seconds of flapping
+  var BIRD_REST  = 1.30;   // seconds of stillness in between
+  var BIRD_RAMP  = 0.15;   // ease in and out, so a burst never starts or stops mid-beat
+  var BIRDS = {
+    bird1: { u: 0.3877, v: 0.3856, amp: 0.16, freq: 3.4, delay: 0.00 },
+    bird2: { u: 0.7317, v: 0.3667, amp: 0.14, freq: 3.8, delay: 1.10 }
+  };
+
+  function makeBirdVertexShader(bird){
+    var cycle = BIRD_BURST + BIRD_REST;
+    var f = function(n){ return n.toFixed(5); };
+    // pivot from canvas UV into the plane's own coordinates
+    var px = f((bird.u - 0.5) * PLANE_W), py = f((bird.v - 0.5) * PLANE_H);
+    // BRANCH_SPAN's sway profile, frozen at this bird's perch height
+    var bt = Math.min(Math.max((bird.v - BRANCH_SPAN.vMin) / (BRANCH_SPAN.vMax - BRANCH_SPAN.vMin), 0), 1);
+    var perch = f(Math.pow(bt, 1.6));
+    var A = BRANCH_SPAN.amp, P = BRANCH_SPAN.phase.toFixed(2), V = bird.v;
+    return [
+      'varying vec2 vUv;',
+      'uniform float uTime;',
+      'void main(){',
+      '  vUv = uv;',
+      '  vec3 pos = position;',
+      // rock on the perch: a burst of quick beats, then a hold
+      '  float tt = mod(uTime + ' + f(bird.delay) + ', ' + f(cycle) + ');',
+      '  float env = smoothstep(0.0, ' + f(BIRD_RAMP) + ', tt)',
+      '            * (1.0 - smoothstep(' + f(BIRD_BURST - BIRD_RAMP) + ', ' + f(BIRD_BURST) + ', tt));',
+      '  float a = ' + f(bird.amp) + ' * sin(6.2831853 * ' + f(bird.freq) + ' * tt) * env;',
+      '  float s = sin(a), c = cos(a);',
+      '  vec2 d = pos.xy - vec2(' + px + ', ' + py + ');',
+      '  pos.xy = vec2(' + px + ', ' + py + ') + vec2(d.x * c - d.y * s, d.x * s + d.y * c);',
+      // and ride the branch underneath, rigidly
+      '  pos.x += (sin(' + f(V * 6.0) + ' + uTime * 1.1 + ' + P + ') * ' + f(A),
+      '          + sin(' + f(V * 16.0) + ' - uTime * 2.4 + ' + P + ') * ' + f(A * 0.28) + ') * ' + perch + ';',
+      '  pos.z += cos(' + f(V * 4.0) + ' + uTime * 0.85 + ' + P + ') * ' + f(A * 0.5) + ' * ' + perch + ';',
+      '  gl_Position = projectionMatrix * modelViewMatrix * vec4(pos, 1.0);',
+      '}'
+    ].join('\n');
+  }
+
+  // sway=0 at the anchor (top for hair, trunk for branches), reaching 1.0 at the free tips.
+  // Two overlapping sine frequencies — a slow primary swing plus a faster small wobble —
+  // so it doesn't read as one robotic metronome.
+  function makeSwayVertexShader(span){
+    var t = '(clamp((uv.y - ' + span.vMin.toFixed(4) + ') / ' +
+            (span.vMax - span.vMin).toFixed(4) + ', 0.0, 1.0))';
+    var swayTerm = span.anchorAtTop ? 'pow(1.0 - ' + t + ', 1.6)' : 'pow(' + t + ', 1.6)';
+    var p = span.phase.toFixed(2);
+    var src = [
+      'varying vec2 vUv;',
+      'uniform float uTime;',
+      'void main(){',
+      '  vUv = uv;',
+      '  vec3 pos = position;',
+      '  float sway = ' + swayTerm + ';'
+    ];
+    if (span.guardDisc){
+      // distance from the disc centre in units of its own radii: 1.0 is the disc edge,
+      // so the swing is nil at the aperture and full again a little beyond it
+      src.push('  vec2 dv = (uv - vec2(' + DISC.cx + ', ' + DISC.cy + ')) / vec2(' + DISC.rx + ', ' + DISC.ry + ');');
+      src.push('  sway *= smoothstep(1.05, 2.3, length(dv));');
+    }
+    src.push(
+      '  float wave = sin(uv.y * 6.0 + uTime * 1.1 + ' + p + ') * ' + span.amp.toFixed(3),
+      '             + sin(uv.y * 16.0 - uTime * 2.4 + ' + p + ') * ' + (span.amp * 0.28).toFixed(3) + ';',
+      '  pos.x += wave * sway;',
+      '  pos.z += cos(uv.y * 4.0 + uTime * 0.85 + ' + p + ') * ' + (span.amp * 0.5).toFixed(3) + ' * sway;',
+      '  gl_Position = projectionMatrix * modelViewMatrix * vec4(pos, 1.0);',
+      '}'
+    );
+    return src.join('\n');
+  }
+
+  // Any layer can be driven by a sprite sheet: export <layer>_spritesheet.png, point
+  // files[] at it, and add its grid here. Cells run left-to-right then top-to-bottom,
+  // and each cell must hold the whole canvas so its UVs line up with every other layer.
+  // A layer absent from this map renders as a plain still, exactly as before.
+  var sheets = {
+    ocean: { cols: 4, rows: 3, frames: 12, fps: 9 }
+  };
+
+  function sheetUniforms(key, tex, withTime){
+    var s = sheets[key];
+    var u = {
+      uMap: { value: tex },
+      uCell: { value: new THREE.Vector2(0, s ? 1 - 1 / s.rows : 0) },
+      uCellSize: { value: new THREE.Vector2(s ? 1 / s.cols : 1, s ? 1 / s.rows : 1) }
+    };
+    if (withTime) u.uTime = { value: 0 };
+    return u;
+  }
+
+  function stepSheet(key, mat, t){
+    var s = sheets[key];
+    var f = Math.floor(t * s.fps) % s.frames;
+    // row 0 is the top of the image, but V runs bottom-up, so count the row back from 1
+    mat.uniforms.uCell.value.set(
+      (f % s.cols) / s.cols,
+      1 - (Math.floor(f / s.cols) + 1) / s.rows
+    );
+  }
+
+  var meshes = {};
+  var sheetMats = {};
+  var oceanMat = null, hairMat = null, branchesMat = null, heartMat = null;
+  var birdMats = [];
+  var started = false;
+  function ensureStarted(){
+    if (!started){ started = true; resize(); animate(); }
+  }
+
+  Object.keys(files).forEach(function(key){
+    setStatus(key, true, 'loading…');
+    loader.load(files[key], function(tex){
+      setStatus(key, true, tex.image.naturalWidth + '×' + tex.image.naturalHeight);
+      // These sizes aren't powers of two, so WebGL1 can't mipmap them. Without this,
+      // three.js quietly rescales every layer through a canvas at load time — wasted
+      // CPU and a quality hit. On a sprite sheet it matters twice over: mipmaps would
+      // blend neighbouring cells and ghost the next frame into this one.
+      tex.generateMipmaps = false;
+      tex.minFilter = THREE.LinearFilter;
+      tex.magFilter = THREE.LinearFilter;
+      tex.wrapS = tex.wrapT = THREE.ClampToEdgeWrapping;
+      var mat;
+      if (key === 'ocean'){
+        mat = new THREE.ShaderMaterial({
+          transparent: true,
+          uniforms: sheetUniforms(key, tex, true),
+          // The disc holds still. It can do that because the hair's swing is damped to
+          // nothing around the aperture (guardDisc on HAIR_SPAN), so the hole no longer
+          // slides off it and no crescent of wall opens up. The water's own movement
+          // comes from the sheet below, which is what keeps the layer independent.
+          vertexShader: PLAIN_VERT,
+          // The sheet's 12 frames carry the water motion. Layered on top: a little
+          // procedural sun life that costs no frames and no bytes. Sun (0.503, 0.792),
+          // horizon (0.717) and disc bottom (0.497) are measured from the artwork itself,
+          // not guessed — the previous values had the ripple masked to a band that sat
+          // almost entirely below the disc, so it was doing nothing.
+          fragmentShader: [
+            'varying vec2 vUv;',
+            'uniform sampler2D uMap;',
+            'uniform float uTime;',
+            'uniform vec2 uCell;',
+            'uniform vec2 uCellSize;',
+            'const float LOOP = 6.0;',
+            'void main(){',
+            '  float w = 6.2831853 / LOOP;',
+            '  float t = mod(uTime, LOOP);',
+            // each cell holds the whole canvas, so the layer's own UVs map straight in
+            '  vec4 texel = texture2D(uMap, uCell + vUv * uCellSize);',
+            '  vec3 col = texel.rgb;',
+            '  float alpha = texel.a;',
+            '  float swell = 1.0 - smoothstep(0.497, 0.717, vUv.y);',
+            '  vec2 sunPos = vec2(0.503, 0.792);',
+            '  float colWidth = 0.018 + 0.045 * swell;',
+            '  float column = (1.0 - smoothstep(0.0, colWidth, abs(vUv.x - sunPos.x))) * swell;',
+            '  float sparkle = sin(vUv.y * 520.0 - 5.0 * w * t) * sin(vUv.x * 95.0 + 3.0 * w * t);',
+            '  col += vec3(1.0, 0.88, 0.62) * smoothstep(0.75, 1.0, sparkle) * column * 0.40;',
+            // canvas is taller than it is wide, so correct the aspect or the glow is an oval
+            '  vec2 p = (vUv - sunPos) * vec2(1.0, 3526.0 / 2644.0);',
+            '  float pulse = 0.5 + 0.5 * sin(w * t);',
+            '  col += vec3(1.0, 0.72, 0.33) * (1.0 - smoothstep(0.0, 0.045, length(p))) * pulse * 0.30;',
+            '  gl_FragColor = vec4(col, alpha);',
+            '}'
+          ].join('\n')
+        });
+        oceanMat = mat;
+      } else if (key === 'hair' || key === 'branches'){
+        // Sway is a transform of the whole shape, so it stays procedural — smoother and
+        // far lighter than baking it into frames. A sheet can still drive this layer's
+        // texture underneath, for motion a transform can't express.
+        var atTop = (key === 'hair');
+        mat = new THREE.ShaderMaterial({
+          transparent: true,
+          uniforms: sheetUniforms(key, tex, true),
+          vertexShader: makeSwayVertexShader(atTop ? HAIR_SPAN : BRANCH_SPAN),
+          fragmentShader: SHEET_FRAG
+        });
+        if (atTop) hairMat = mat; else branchesMat = mat;
+      } else if (key === 'heart'){
+        // The heart sits in the branches' cut-out, and the branches aren't guarded around
+        // it, so it still has to ride their sway or the hole tears open around it.
+        mat = new THREE.ShaderMaterial({
+          transparent: true,
+          uniforms: sheetUniforms(key, tex, true),
+          vertexShader: makeSwayVertexShader(BRANCH_SPAN),
+          fragmentShader: SHEET_FRAG
+        });
+        heartMat = mat;
+      } else if (BIRDS[key]){
+        mat = new THREE.ShaderMaterial({
+          transparent: true,
+          uniforms: sheetUniforms(key, tex, true),
+          vertexShader: makeBirdVertexShader(BIRDS[key]),
+          fragmentShader: SHEET_FRAG
+        });
+        birdMats.push(mat);
+      } else if (sheets[key]){
+        mat = new THREE.ShaderMaterial({
+          transparent: true,
+          uniforms: sheetUniforms(key, tex, false),
+          vertexShader: PLAIN_VERT,
+          fragmentShader: SHEET_FRAG
+        });
+      } else {
+        mat = new THREE.MeshBasicMaterial({ map: tex, transparent: true });
+      }
+      if (sheets[key]) sheetMats[key] = mat;
+      // only the flat background can skip the extra segments a bend needs
+      // a bird only ever rotates and translates as a whole, and the background never
+      // moves at all — neither needs the extra rows a bending layer does
+      var meshGeo = (key === 'background' || BIRDS[key]) ? geo : geoBend;
+      var mesh = new THREE.Mesh(meshGeo, mat);
+      mesh.position.z = depths[key];
+      meshes[key] = mesh;
+      scene.add(mesh);
+      ensureStarted();
+    }, undefined, function(err){
+      setStatus(key, false, (err && err.message) ? err.message : 'failed to load ' + files[key]);
+      console.error('Layer failed to load:', key, files[key], err);
+      ensureStarted();
+    });
+  });
+
+  function heartbeat(t){
+    var period = 1.15;
+    var tt = (t % period) / period;
+    var lub = Math.exp(-Math.pow((tt - 0.05) / 0.035, 2));
+    var dub = Math.exp(-Math.pow((tt - 0.22) / 0.045, 2)) * 0.7;
+    return 1 + 0.05 * (lub + dub);
+  }
+
+  var targetX = 0, targetY = 0;
+  function setTarget(nx, ny){ targetX = nx; targetY = ny; }
+  stage.addEventListener('mousemove', function(e){
+    var r = stage.getBoundingClientRect();
+    setTarget(((e.clientX - r.left) / r.width - 0.5) * 2, ((e.clientY - r.top) / r.height - 0.5) * 2);
+  });
+  stage.addEventListener('mouseleave', function(){ setTarget(0, 0); });
+  stage.addEventListener('touchmove', function(e){
+    var t = e.touches[0], r = stage.getBoundingClientRect();
+    setTarget(((t.clientX - r.left) / r.width - 0.5) * 2, ((t.clientY - r.top) / r.height - 0.5) * 2);
+    e.preventDefault();
+  }, { passive: false });
+
+  var clock = new THREE.Clock();
+  function animate(){
+    requestAnimationFrame(animate);
+    var t = clock.getElapsedTime();
+    if (oceanMat) oceanMat.uniforms.uTime.value = t;
+    if (hairMat) hairMat.uniforms.uTime.value = t;
+    if (branchesMat) branchesMat.uniforms.uTime.value = t;
+    if (heartMat) heartMat.uniforms.uTime.value = t;
+    for (var bi = 0; bi < birdMats.length; bi++) birdMats[bi].uniforms.uTime.value = t;
+    Object.keys(sheetMats).forEach(function(k){ stepSheet(k, sheetMats[k], t); });
+    if (meshes.heart) meshes.heart.scale.setScalar(heartbeat(t));
+    camera.position.x += (targetX * 0.5 - camera.position.x) * 0.08;
+    camera.position.y += (-targetY * 0.34 - camera.position.y) * 0.08;
+    camera.position.z = camDist;
+    camera.lookAt(0, 0, 0);
+    renderer.render(scene, camera);
+  }
+  resize();
+})();
+</script>

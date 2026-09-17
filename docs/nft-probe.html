@@ -1,0 +1,243 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>NFT axis probe</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script src="vendor/ar-threex.js"></script>
+<style>
+  body{margin:0;background:#222;color:#ddd;font:12px ui-monospace,monospace}
+  #out{position:absolute;right:0;top:0;width:52%;height:100%;overflow:auto;
+       background:#111;padding:10px;white-space:pre-wrap;z-index:9}
+  canvas{position:absolute;top:0;left:0}
+</style>
+</head>
+<body>
+<div id="out">probing…</div>
+<script>
+(function(){
+var out = document.getElementById('out');
+var log = [];
+function P(s){ log.push(s); out.textContent = log.join('\n'); }
+
+// The tracked image lives inside the descriptor itself: painting1.iset is a 4-byte
+// header followed by one JPEG. Extracting it guarantees the test source is exactly
+// what the tracker was trained on, so a detection failure can only mean the pipeline
+// is wrong, never that the image was.
+var REF = { w: 2644, h: 3526, dpi: 300 };
+var Wmm = REF.w / REF.dpi * 25.4, Hmm = REF.h / REF.dpi * 25.4;
+P('reference image ' + REF.w + 'x' + REF.h + ' @' + REF.dpi + 'dpi  ->  ' +
+  Wmm.toFixed(2) + ' x ' + Hmm.toFixed(2) + ' mm');
+
+// where we will draw the painting inside a 640x480 frame - known ground truth
+var FRAME_W = 640, FRAME_H = 480;
+var Q = new URLSearchParams(location.search);
+var DRAW_H = parseFloat(Q.get('h')) || 440;
+var DRAW_W = DRAW_H * (REF.w / REF.h);
+var DRAW_X = parseFloat(Q.get('x')) || (FRAME_W - DRAW_W) / 2;
+var DRAW_Y = parseFloat(Q.get('y')) || (FRAME_H - DRAW_H) / 2;
+P('drawn at x=' + DRAW_X.toFixed(1) + ' y=' + DRAW_Y.toFixed(1) +
+  ' w=' + DRAW_W.toFixed(1) + ' h=' + DRAW_H.toFixed(1));
+
+// ground-truth corners in frame pixels, TL TR BR BL
+var GT = [
+  [DRAW_X,          DRAW_Y],
+  [DRAW_X + DRAW_W, DRAW_Y],
+  [DRAW_X + DRAW_W, DRAW_Y + DRAW_H],
+  [DRAW_X,          DRAW_Y + DRAW_H]
+];
+
+var renderer = new THREE.WebGLRenderer({alpha:true});
+renderer.setSize(FRAME_W, FRAME_H);
+document.body.appendChild(renderer.domElement);
+var scene = new THREE.Scene();
+var camera = new THREE.Camera();
+scene.add(camera);
+var markerRoot = new THREE.Group();
+scene.add(markerRoot);
+
+var gotProj = false, solved = false;
+
+fetch('output/painting1.iset').then(function(r){ return r.arrayBuffer(); }).then(function(buf){
+  var url = URL.createObjectURL(new Blob([buf.slice(4)], {type:'image/jpeg'}));
+  var img = new Image();
+  img.onload = function(){
+    P('iset jpeg decoded: ' + img.naturalWidth + 'x' + img.naturalHeight);
+    var c = document.createElement('canvas');
+    c.width = FRAME_W; c.height = FRAME_H;
+    var g = c.getContext('2d');
+    g.fillStyle = '#888'; g.fillRect(0,0,FRAME_W,FRAME_H);
+    g.drawImage(img, DRAW_X, DRAW_Y, DRAW_W, DRAW_H);
+    start(c.toDataURL('image/jpeg', 0.92));
+  };
+  img.onerror = function(){ P('FAILED to decode extracted jpeg'); };
+  img.src = url;
+}).catch(function(e){ P('fetch iset failed: ' + e); });
+
+function start(dataUrl){
+  THREEx.ArToolkitContext.baseURL = './';
+  var src = new THREEx.ArToolkitSource({
+    sourceType: 'image', sourceUrl: dataUrl,
+    sourceWidth: FRAME_W, sourceHeight: FRAME_H,
+    displayWidth: FRAME_W, displayHeight: FRAME_H
+  });
+  src.init(function onReady(){
+    P('source ready');
+    setTimeout(function(){ initCtx(src); }, 300);
+  }, function(){ P('source FAILED'); });
+}
+
+function initCtx(src){
+  var ctx = new THREEx.ArToolkitContext({
+    cameraParametersUrl: 'ar-data/camera_para.dat',
+    detectionMode: 'mono',
+    canvasWidth: FRAME_W, canvasHeight: FRAME_H
+  });
+  ctx.init(function(){ P('context init done'); });
+
+  var mc = new THREEx.ArMarkerControls(ctx, markerRoot, {
+    type: 'nft',
+    descriptorsUrl: 'output/painting1',
+    changeMatrixMode: 'modelViewMatrix'
+  });
+  markerRoot.visible = false;
+  P('marker controls created (nft)');
+
+  // AR.js registers its NFT worker behind an arjs-video-loaded listener, but
+  // ArToolkitSource already dispatched that event before we existed. Re-dispatch it.
+  // The handler reads clientWidth/clientHeight and then uses them as drawImage's
+  // SOURCE rect, which is in intrinsic pixels - so show it the intrinsic size.
+  var kicks = 0;
+  (function kick(){
+    var ac = ctx.arController;
+    if (ac && ac.canvas.width === FRAME_W){
+      var el = src.domElement;
+      // _initSourceImage never appends the <img>, so clientWidth/Height are 0 and the
+      // handler's 320/Math.max(0,0) makes an Infinity-sized detector canvas -> the
+      // worker's arController fails with "No canvas available". Give it real layout.
+      if (!el.isConnected){ el.style.position='absolute'; el.style.left='-99999px';
+                            document.body.appendChild(el); }
+      var pw = el.style.width, ph = el.style.height;
+      el.style.width = FRAME_W + 'px'; el.style.height = FRAME_H + 'px';
+      void el.clientWidth;
+      window.dispatchEvent(new CustomEvent('arjs-video-loaded', {detail:{component: el}}));
+      el.style.width = pw; el.style.height = ph;
+      P('dispatched arjs-video-loaded (kick ' + kicks + ')');
+    }
+    if (++kicks < 80) setTimeout(kick, 50);
+  })();
+
+  window.addEventListener('arjs-nft-loaded', function(){
+    // AR.js writes the worker's projection into the controls' object3d.matrix
+    if (gotProj) return;
+    var m = markerRoot.matrix.clone();
+    var nonZero = m.elements.some(function(v){ return v !== 0; });
+    P('\narjs-nft-loaded. markerRoot.matrix nonZero=' + nonZero);
+    P('captured proj = [' + m.elements.map(function(v){return v.toFixed(4);}).join(', ') + ']');
+    if (nonZero){
+      camera.projectionMatrix.copy(m);
+      var e = camera.projectionMatrix.elements;
+      P('implied near/far from e[10],e[14]: ' + e[10].toFixed(6) + ' ' + e[14].toFixed(4));
+      var n = 10, f = 20000;
+      e[10] = -(f+n)/(f-n); e[14] = -2*f*n/(f-n);
+      camera.projectionMatrixInverse.copy(camera.projectionMatrix).invert();
+      gotProj = true;
+      P('far plane repatched to ' + f + 'mm');
+    }
+    markerRoot.matrix.identity();
+  });
+
+  window.addEventListener('arjs-nft-init-data', function(ev){
+    P('\narjs-nft-init-data: ' + JSON.stringify(ev.detail));
+  });
+
+  setTimeout(function(){ if(!solved) P('\n*** 25s: no solve yet ***'); }, 25000);
+  animate(ctx, src);
+}
+
+function animate(ctx, src){
+  requestAnimationFrame(function(){ animate(ctx, src); });
+  if (ctx.arController) ctx.update(src.domElement);
+  if (markerRoot.visible && gotProj && !solved) solve();
+  renderer.render(scene, camera);
+}
+
+var AX = {
+  '+X': new THREE.Vector3(1,0,0),  '-X': new THREE.Vector3(-1,0,0),
+  '+Y': new THREE.Vector3(0,1,0),  '-Y': new THREE.Vector3(0,-1,0),
+  '+Z': new THREE.Vector3(0,0,1),  '-Z': new THREE.Vector3(0,0,-1)
+};
+
+function solve(){
+  solved = true;
+  var q = markerRoot.quaternion, pos = markerRoot.position;
+  P('\n=== DETECTED ===');
+  P('markerRoot.position ' + ['x','y','z'].map(function(k){return k+'='+pos[k].toFixed(2);}).join(' ') +
+    '   |p|=' + pos.length().toFixed(2) + ' mm');
+  P('markerRoot.scale    ' + ['x','y','z'].map(function(k){return k+'='+markerRoot.scale[k].toFixed(4);}).join(' '));
+  ['+X','+Y','+Z'].forEach(function(k){
+    var v = AX[k].clone().applyQuaternion(q);
+    P('marker ' + k + ' -> camera (' + v.x.toFixed(3)+', '+v.y.toFixed(3)+', '+v.z.toFixed(3)+')');
+  });
+
+  // expected distance if units really are mm: fy' * Hmm / h_px_in_detector
+  P('\nsanity: |p| should be ~ fy*Hmm/drawnHeightPx in the detector frame');
+
+  var M = markerRoot.matrix.clone();
+  function project(v3){
+    var v = v3.clone().applyMatrix4(M).applyMatrix4(camera.projectionMatrix);
+    return [(v.x*0.5+0.5)*FRAME_W, (1 - (v.y*0.5+0.5))*FRAME_H];
+  }
+
+  var names = Object.keys(AX);
+  var origins = {
+    'centre'      : function(R,U){ return new THREE.Vector3(0,0,0); },
+    'corner -R-U' : function(R,U){ return R.clone().multiplyScalar(Wmm/2).add(U.clone().multiplyScalar(Hmm/2)); },
+    'corner +R-U' : function(R,U){ return R.clone().multiplyScalar(-Wmm/2).add(U.clone().multiplyScalar(Hmm/2)); },
+    'corner -R+U' : function(R,U){ return R.clone().multiplyScalar(Wmm/2).add(U.clone().multiplyScalar(-Hmm/2)); },
+    'corner +R+U' : function(R,U){ return R.clone().multiplyScalar(-Wmm/2).add(U.clone().multiplyScalar(-Hmm/2)); }
+  };
+
+  var results = [];
+  names.forEach(function(rn){
+    names.forEach(function(un){
+      var R = AX[rn], U = AX[un];
+      if (Math.abs(R.dot(U)) > 0.001) return;   // must be perpendicular
+      Object.keys(origins).forEach(function(on){
+        var C = origins[on](R,U);
+        // corners TL TR BR BL in marker space
+        var pts = [
+          C.clone().add(R.clone().multiplyScalar(-Wmm/2)).add(U.clone().multiplyScalar( Hmm/2)),
+          C.clone().add(R.clone().multiplyScalar( Wmm/2)).add(U.clone().multiplyScalar( Hmm/2)),
+          C.clone().add(R.clone().multiplyScalar( Wmm/2)).add(U.clone().multiplyScalar(-Hmm/2)),
+          C.clone().add(R.clone().multiplyScalar(-Wmm/2)).add(U.clone().multiplyScalar(-Hmm/2))
+        ];
+        var se = 0;
+        for (var i=0;i<4;i++){
+          var p = project(pts[i]);
+          se += Math.pow(p[0]-GT[i][0],2) + Math.pow(p[1]-GT[i][1],2);
+        }
+        results.push({ right: rn, up: un, origin: on, rms: Math.sqrt(se/4) });
+      });
+    });
+  });
+  results.sort(function(a,b){ return a.rms - b.rms; });
+  P('\n=== BEST FITS (rms pixel error vs known drawn rect) ===');
+  results.slice(0,6).forEach(function(r,i){
+    P((i+1) + '. right=' + r.right + '  up=' + r.up + '  origin=' + r.origin +
+      '   rms=' + r.rms.toFixed(1) + 'px');
+  });
+  var b = results[0];
+  P('\nWINNER: RIGHT=' + b.right + '  UP=' + b.up + '  ORIGIN=' + b.origin + '  (' + b.rms.toFixed(1) + 'px)');
+  P('projected corners: ' + [0,1,2,3].map(function(i){
+      var R=AX[b.right],U=AX[b.up],C=origins[b.origin](R,U);
+      var sx=[-1,1,1,-1][i], sy=[1,1,-1,-1][i];
+      var p = project(C.clone().add(R.clone().multiplyScalar(sx*Wmm/2)).add(U.clone().multiplyScalar(sy*Hmm/2)));
+      return '('+p[0].toFixed(0)+','+p[1].toFixed(0)+')';
+    }).join(' '));
+  P('ground truth      : ' + GT.map(function(p){return '('+p[0].toFixed(0)+','+p[1].toFixed(0)+')';}).join(' '));
+}
+})();
+</script>
+</body>
+</html>
