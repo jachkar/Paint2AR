@@ -1,8 +1,11 @@
+
 # Painting One — AR
 
 Point a phone at a painting and it comes alive: the ocean ripples, the hair and branches
 sway, two birds flap on their perch, and a heart beats — all registered 1:1 over the
 physical artwork, with real parallax between the layers as you move.
+
+https://github.com/user-attachments/assets/43a6dc5b-a6cb-4c8f-8ac5-1631935040c7
 
 Built with [three.js](https://threejs.org/) and [AR.js](https://ar-js-org.github.io/AR.js-Docs/)
 image tracking (NFT). No app, no marker card — the painting itself is the tracking target.
